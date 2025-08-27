@@ -1,3 +1,54 @@
+var algolia = {
+	allowedHooks: [
+		'beforeAutocompleteSources',
+		'beforeAutocompleteOptions',
+		'beforeInstantsearchInit',
+		'beforeWidgetInitialization',
+		'beforeInstantsearchStart',
+		'afterInstantsearchStart'
+	],
+	registeredHooks: [],
+	registerHook: function (hookName, callback) {
+		if (this.allowedHooks.indexOf(hookName) === -1) {
+			throw 'Hook "' + hookName + '" cannot be defined. Please use one of ' + this.allowedHooks.join(', ');
+		}
+
+		if (!this.registeredHooks[hookName]) {
+			this.registeredHooks[hookName] = [callback];
+		} else {
+			this.registeredHooks[hookName].push(callback);
+		}
+	},
+	getRegisteredHooks: function(hookName) {
+		if (this.allowedHooks.indexOf(hookName) === -1) {
+			throw 'Hook "' + hookName + '" cannot be defined. Please use one of ' + this.allowedHooks.join(', ');
+		}
+
+		if (!this.registeredHooks[hookName]) {
+			return [];
+		}
+
+		return this.registeredHooks[hookName];
+	},
+	triggerHooks: function () {
+		var hookName = arguments[0],
+			originalData = arguments[1],
+			hookArguments = Array.prototype.slice.call(arguments, 2);
+
+		var data = this.getRegisteredHooks(hookName).reduce(function(currentData, hook) {
+			if (Array.isArray(currentData)) {
+				currentData = [currentData];
+			}
+			
+			var allParameters = [].concat(currentData).concat(hookArguments);
+			
+			return hook.apply(null, allParameters);
+		}, originalData);
+
+		return data;
+	}
+};
+
 document.addEventListener("DOMContentLoaded", function (e) {
 	algoliaBundle.$(function ($) {
 		window.isMobile = function() {
@@ -8,7 +59,7 @@ document.addEventListener("DOMContentLoaded", function (e) {
 			return check;
 		};
 		
-		window.transformHit = function (hit, price_key) {
+		window.transformHit = function (hit, price_key, helper) {
 			if (Array.isArray(hit.categories)) {
 				hit.categories = hit.categories.join(', ');
 			}
@@ -20,7 +71,19 @@ document.addEventListener("DOMContentLoaded", function (e) {
 
 				hit.categories_without_path = hit.categories_without_path.join(', ');
 			}
-
+			
+			var matchedColors = [];
+			
+			if (helper && algoliaConfig.useAdaptiveImage === true) {
+				if (hit.images_data && helper.state.facetsRefinements.color) {
+					matchedColors = helper.state.disjunctiveFacetsRefinements.color.slice(0); // slice to clone
+				}
+				
+				if (hit.images_data && helper.state.disjunctiveFacetsRefinements.color) {
+					matchedColors = helper.state.disjunctiveFacetsRefinements.color.slice(0); // slice to clone
+				}
+			}
+			
 			if (Array.isArray(hit.color)) {
 				var colors = [];
 
@@ -28,16 +91,42 @@ document.addEventListener("DOMContentLoaded", function (e) {
 					if (color.matchLevel === 'none') {
 						return;
 					}
-
+					
 					colors.push(color.value);
+					
+					if (algoliaConfig.useAdaptiveImage === true) {
+						var re = /<em>(.*?)<\/em>/g;
+						var matchedWords = color.value.match(re).map(function (val) {
+							return val.replace(/<\/?em>/g, '');
+						});
+						
+						var matchedColor = matchedWords.join(' ');
+						
+						if (hit.images_data && color.fullyHighlighted && color.fullyHighlighted === true) {
+							matchedColors.push(matchedColor);
+						}
+					}
 				});
 
 				colors = colors.join(', ');
 
-				hit._highlightResult.color = {value: colors};
+				hit._highlightResult.color = { value: colors };
 			}
 			else if (hit._highlightResult.color && hit._highlightResult.color.matchLevel === 'none') {
-				hit._highlightResult.color = {value: ''};
+				hit._highlightResult.color = { value: '' };
+			}
+			
+			if (algoliaConfig.useAdaptiveImage === true) {
+				$.each(matchedColors, function (i, color) {
+					color = color.toLowerCase();
+					
+					if (hit.images_data[color]) {
+						hit.image_url = hit.images_data[color];
+						hit.thumbnail_url = hit.images_data[color];
+						
+						return false;
+					}
+				});
 			}
 
 			if (hit._highlightResult.color && hit._highlightResult.color.value && hit.categories_without_path) {
@@ -45,7 +134,6 @@ document.addEventListener("DOMContentLoaded", function (e) {
 					hit.categories_without_path = '';
 				}
 			}
-
 
 			if (Array.isArray(hit._highlightResult.name)) {
 				hit._highlightResult.name = hit._highlightResult.name[0];
@@ -58,6 +146,29 @@ document.addEventListener("DOMContentLoaded", function (e) {
 			if (hit['price'] !== undefined && price_key !== '.' + algoliaConfig.currencyCode + '.default' && hit['price'][algoliaConfig.currencyCode][price_key.substr(1) + '_formated'] !== hit['price'][algoliaConfig.currencyCode]['default_formated']) {
 				hit['price'][algoliaConfig.currencyCode][price_key.substr(1) + '_original_formated'] = hit['price'][algoliaConfig.currencyCode]['default_formated'];
 			}
+			
+			if (hit['price'] !== undefined && hit['price'][algoliaConfig.currencyCode]['default_original_formated']
+				&& hit['price'][algoliaConfig.currencyCode]['special_to_date']) {
+				var priceExpiration = hit['price'][algoliaConfig.currencyCode]['special_to_date'];
+
+				if (algoliaConfig.now > priceExpiration) {
+					hit['price'][algoliaConfig.currencyCode]['default_formated'] = hit['price'][algoliaConfig.currencyCode]['default_original_formated'];
+					hit['price'][algoliaConfig.currencyCode]['default_original_formated'] = false;
+				}
+			}
+
+			if (hit.__queryID) {
+				var insightsDataUrlString = $.param({
+					queryID: hit.__queryID,
+					objectID: hit.objectID,
+					indexName: hit.__indexName
+				});
+				if (hit.url.indexOf('?') > -1) {
+					hit.urlForInsights = hit.url + insightsDataUrlString
+				} else {
+					hit.urlForInsights = hit.url + '?' + insightsDataUrlString;
+				}
+			}
 
 			return hit;
 		};
@@ -69,7 +180,8 @@ document.addEventListener("DOMContentLoaded", function (e) {
 
 			var options = {
 				hitsPerPage: section.hitsPerPage,
-				analyticsTags: 'autocomplete'
+				analyticsTags: 'autocomplete',
+				clickAnalytics: true
 			};
 
 			var source;
@@ -77,6 +189,7 @@ document.addEventListener("DOMContentLoaded", function (e) {
 			if (section.name === "products") {
 				options.facets = ['categories.level0'];
 				options.numericFilters = 'visibility_search=1';
+				options.ruleContexts = ['', 'magento_filters']; // Empty context to keep BC for already create rules in dashboard
 
 				source = {
 					source: $.fn.autocomplete.sources.hits(algolia_client.initIndex(algoliaConfig.indexName + "_" + section.name), options),
@@ -104,8 +217,12 @@ document.addEventListener("DOMContentLoaded", function (e) {
 
 							return template;
 						},
-						suggestion: function (hit) {
-							hit = transformHit(hit, algoliaConfig.priceKey)
+						suggestion: function (hit, payload) {
+							hit.__indexName = algoliaConfig.indexName + "_" + section.name;
+							hit.__queryID = payload.queryID;
+							hit.__position = payload.hits.indexOf(hit) + 1;
+
+							hit = transformHit(hit, algoliaConfig.priceKey);
 							hit.displayKey = hit.displayKey || hit.name;
 
 							return algoliaConfig.autocomplete.templates[section.name].render(hit);
@@ -123,7 +240,7 @@ document.addEventListener("DOMContentLoaded", function (e) {
 					name: i,
 					templates: {
 						empty: '<div class="aa-no-results">' + algoliaConfig.translations.noResults + '</div>',
-						suggestion: function (hit) {
+						suggestion: function (hit, payload) {
 							if (section.name === 'categories') {
 								hit.displayKey = hit.path;
 							}
@@ -145,6 +262,8 @@ document.addEventListener("DOMContentLoaded", function (e) {
 							}
 
 							hit.displayKey = hit.displayKey || hit.name;
+							hit.__queryID = payload.queryID;
+							hit.__position = payload.hits.indexOf(hit) + 1;
 
 							return algoliaConfig.autocomplete.templates[section.name].render(hit);
 						}
@@ -158,9 +277,7 @@ document.addEventListener("DOMContentLoaded", function (e) {
 					suggestionsSource;
 				
 				if (algoliaConfig.autocomplete.displaySuggestionsCategories == true) {
-					suggestionsSource = $.fn.autocomplete.sources.popularIn(suggestions_index, {
-						hitsPerPage: section.hitsPerPage
-						}, {
+					suggestionsSource = $.fn.autocomplete.sources.popularIn(suggestions_index, options, {
 							source: 'query',
 							index: products_index,
 							facets: ['categories.level0'],
@@ -173,7 +290,7 @@ document.addEventListener("DOMContentLoaded", function (e) {
 							allTitle: algoliaConfig.translations.allDepartments
 						});
 				} else {
-					suggestionsSource = $.fn.autocomplete.sources.hits(suggestions_index, {
+					suggestionsSource = $.fn.autocomplete.sources.hits(suggestions_index, options, {
 						hitsPerPage: section.hitsPerPage
 					});
 				}
@@ -183,7 +300,7 @@ document.addEventListener("DOMContentLoaded", function (e) {
 					displayKey: 'query',
 					name: section.name,
 					templates: {
-						suggestion: function (hit) {
+						suggestion: function (hit, payload) {
 							if (hit.facet) {
 								hit.category = hit.facet.value;
 							}
@@ -193,6 +310,11 @@ document.addEventListener("DOMContentLoaded", function (e) {
 							} else {
 								hit.url = algoliaConfig.baseUrl + '/catalogsearch/result/?q=' + hit.query;
 							}
+							
+							var toEscape = hit._highlightResult.query.value;
+							hit._highlightResult.query.value = algoliaBundle.autocomplete.escapeHighlightedString(toEscape);
+							hit.__queryID = payload.queryID;
+							hit.__position = payload.hits.indexOf(hit) + 1;
 
 							return algoliaConfig.autocomplete.templates.suggestions.render(hit);
 						}
@@ -203,15 +325,14 @@ document.addEventListener("DOMContentLoaded", function (e) {
 				var index = algolia_client.initIndex(algoliaConfig.indexName + "_section_" + section.name);
 
 				source = {
-					source: $.fn.autocomplete.sources.hits(index, {
-						hitsPerPage: section.hitsPerPage,
-						analyticsTags: 'autocomplete'
-					}),
+					source: $.fn.autocomplete.sources.hits(index, options),
 					displayKey: 'value',
 					name: i,
 					templates: {
-						suggestion: function (hit) {
+						suggestion: function (hit, payload) {
 							hit.url = algoliaConfig.baseUrl + '/catalogsearch/result/?q=' + encodeURIComponent(hit.value) + '&refinement_key=' + section.name;
+							hit.__queryID = payload.queryID;
+							hit.__position = payload.hits.indexOf(hit) + 1;
 							return algoliaConfig.autocomplete.templates.additionnalSection.render(hit);
 						}
 					}
@@ -221,13 +342,17 @@ document.addEventListener("DOMContentLoaded", function (e) {
 			if (section.name === 'products') {
 				source.templates.footer = function (query, content) {
 					var keys = [];
-					for (var key in content.facets['categories.level0']) {
-						var url = algoliaConfig.baseUrl + '/catalogsearch/result/?q=' + encodeURIComponent(query.query) + '#q=' + encodeURIComponent(query.query) + '&hFR[categories.level0][0]=' + encodeURIComponent(key) + '&idx=' + algoliaConfig.indexName + '_products';
-						keys.push({
-							key: key,
-							value: content.facets['categories.level0'][key],
-							url: url
-						});
+					for (var i = 0; i<algoliaConfig.facets.length; i++) {
+						if (algoliaConfig.facets[i].attribute == "categories") {
+							for (var key in content.facets['categories.level0']) {
+								var url = algoliaConfig.baseUrl + '/catalogsearch/result/?q=' + encodeURIComponent(query.query) + '#q=' + encodeURIComponent(query.query) + '&hFR[categories.level0][0]=' + encodeURIComponent(key) + '&idx=' + algoliaConfig.indexName + '_products';
+								keys.push({
+									key: key,
+									value: content.facets['categories.level0'][key],
+									url: url
+								});
+							}
+						}
 					}
 
 					keys.sort(function (a, b) {
@@ -237,11 +362,11 @@ document.addEventListener("DOMContentLoaded", function (e) {
 					var ors = '';
 
 					if (keys.length > 0) {
-						ors += '<span><a href="' + keys[0].url + '">' + keys[0].key + '</a></span>';
-					}
-
-					if (keys.length > 1) {
-						ors += ', <span><a href="' + keys[1].url + '">' + keys[1].key + '</a></span>';
+						var orsTab = [];
+						for (var i = 0; i < keys.length && i < 2; i++) {
+							orsTab.push('<span><a href="' + keys[i].url + '">' + keys[i].key + '</a></span>');
+						}
+						ors = orsTab.join(', ');
 					}
 
 					var allUrl = algoliaConfig.baseUrl + '/catalogsearch/result/?q=' + encodeURIComponent(query.query);
@@ -260,6 +385,8 @@ document.addEventListener("DOMContentLoaded", function (e) {
 			if (section.name !== 'suggestions' && section.name !== 'products') {
 				source.templates.header = '<div class="category">' + (section.label ? section.label : section.name) + '</div>';
 			}
+
+			source.indexName = algoliaConfig.indexName + "_" + section.name;
 
 			return source;
 		};
@@ -356,6 +483,13 @@ document.addEventListener("DOMContentLoaded", function (e) {
 				input.closest('#instant-search-box').find('.clear-query-instant').hide();
 			}
 		};
+		
+		window.createISWidgetContainer = function (attributeName) {
+			var div = document.createElement('div');
+			div.className = 'is-widget-container-' + attributeName.split('.').join('_');
+			
+			return div;
+		};
 
 		var instant_selector = !algoliaConfig.autocomplete.enabled ? ".algolia-search-input" : "#instant-search-bar";
 
@@ -378,7 +512,11 @@ document.addEventListener("DOMContentLoaded", function (e) {
 			var input = $(this).closest('#algolia-searchbox').find('input');
 			input.val('');
 
-			if (algoliaConfig.autocomplete.enabled && !algoliaConfig.instant.enabled) {
+			if (input.data('aaAutocomplete')) {
+				input.data('aaAutocomplete').input.query = '';
+			}
+
+			if (algoliaConfig.autocomplete.enabled != algoliaConfig.instant.enabled) {
 				input.get(0).dispatchEvent(new Event('input'));
 			}
 
@@ -400,6 +538,5 @@ document.addEventListener("DOMContentLoaded", function (e) {
 			this.focus();
 			window.scrollTo(x, y);
 		};
-
 	});
 });

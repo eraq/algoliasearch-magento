@@ -14,6 +14,9 @@ abstract class Algolia_Algoliasearch_Helper_Entity_Helper
     protected static $_activeCategories;
     protected static $_categoryNames;
 
+    /** @var array */
+    private $nonCastableAttributes = array('sku', 'name', 'description');
+
     abstract protected function getIndexNameSuffix();
 
     public function __construct()
@@ -21,6 +24,12 @@ abstract class Algolia_Algoliasearch_Helper_Entity_Helper
         $this->config = Mage::helper('algoliasearch/config');
         $this->algolia_helper = Mage::helper('algoliasearch/algoliahelper');
         $this->logger = Mage::helper('algoliasearch/logger');
+
+        // Merge non castable attributes set in config
+        $this->nonCastableAttributes = array_merge(
+            $this->nonCastableAttributes,
+            $this->config->getNonCastableAttributes()
+        );
     }
 
     public function getBaseIndexName($storeId = null)
@@ -54,10 +63,8 @@ abstract class Algolia_Algoliasearch_Helper_Entity_Helper
 
     protected function castProductObject(&$productData)
     {
-        $nonCastableAttributes = array('sku', 'name', 'description');
-
         foreach ($productData as $key => &$data) {
-            if (in_array($key, $nonCastableAttributes, true) === true) {
+            if (in_array($key, $this->nonCastableAttributes, true) === true) {
                 continue;
             }
 
@@ -78,14 +85,36 @@ abstract class Algolia_Algoliasearch_Helper_Entity_Helper
         }
     }
 
-    protected function strip($s)
+    protected function strip($s, $completeRemoveTags = array())
     {
+        if (!empty($completeRemoveTags)) {
+            $dom = new DOMDocument();
+            if (@$dom->loadHTML('<?xml encoding="utf-8" ?>' . $s)) {
+                $toRemove = array();
+                foreach ($completeRemoveTags as $tag) {
+                    $removeTags = $dom->getElementsByTagName($tag);
+
+                    foreach ($removeTags as $item) {
+                        $toRemove[] = $item;
+                    }
+                }
+
+                foreach ($toRemove as $item) {
+                    $item->parentNode->removeChild($item);
+                }
+
+                $s = $dom->saveHTML();
+            }
+        }
+
         $s = trim(preg_replace('/\s+/', ' ', $s));
         $s = preg_replace('/&nbsp;/', ' ', $s);
         $s = preg_replace('!\s+!', ' ', $s);
         $s = preg_replace('/\{\{[^}]+\}\}/', ' ', $s);
+        $s = strip_tags($s);
+        $s = trim($s);
 
-        return trim(strip_tags($s));
+        return $s;
     }
 
     public function isCategoryActive($categoryId, $storeId = null)
@@ -250,6 +279,8 @@ abstract class Algolia_Algoliasearch_Helper_Entity_Helper
                     $store_ids[] = $store->getId();
                 }
             }
+        } elseif (is_array($store_id)) {
+            return $store_id;
         } else {
             $store_ids = array($store_id);
         }

@@ -25,11 +25,19 @@
  */
 
 require_once __DIR__.'/AlgoliaException.php';
+require_once __DIR__.'/AlgoliaConnectionException.php';
+require_once __DIR__.'/Analytics.php';
 require_once __DIR__.'/Client.php';
 require_once __DIR__.'/ClientContext.php';
+require_once __DIR__.'/FailingHostsCache.php';
+require_once __DIR__.'/FileFailingHostsCache.php';
 require_once __DIR__.'/Index.php';
 require_once __DIR__.'/IndexBrowser.php';
+require_once __DIR__.'/InMemoryFailingHostsCache.php';
+require_once __DIR__.'/Json.php';
 require_once __DIR__.'/PlacesIndex.php';
 require_once __DIR__.'/SynonymType.php';
 require_once __DIR__.'/Version.php';
-require_once __DIR__.'/Json.php';
+require_once __DIR__.'/Iterators/AlgoliaIterator.php';
+require_once __DIR__.'/Iterators/RuleIterator.php';
+require_once __DIR__.'/Iterators/SynonymIterator.php';

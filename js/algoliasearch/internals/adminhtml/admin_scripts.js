@@ -26,12 +26,72 @@ algoliaAdminBundle.$(function($) {
 				' You are using old version of Algolia extension. ' +
 				'Latest version of the extension is '+latestVersion+'. ' +
 				'You can get it on ' +
-				'<a href="https://www.magentocommerce.com/magento-connect/search-algolia-search.html" target="_blank">Magento Connect</a>.<br />' +
+				'<a href="https://marketplace.magento.com/algolia-algoliasearch.html" target="_blank">Magento Marketplace</a>.<br />' +
 				'<small style="color: #2f2f2f; font-size: .8em; padding-left: 36px; display: inline-block">' +
 				'It\'s highly recommended to update your version to avoid any unexpecting issues and to get new features.<br />' +
-				'<i>If you are happy with the extension, please rate the extension on <a href="https://www.magentocommerce.com/magento-connect/search-algolia-search.html" target="_blank">Magento Connect</a>.</i>' +
+				'<i>If you are happy with the extension, please rate the extension on <a href="https://marketplace.magento.com/algolia-algoliasearch.html" target="_blank">Magento Marketplace</a>.</i>' +
 				'</small></td>');
 		}
+	});
+	
+	// Queue info
+	
+	var url = window.location.href,
+		position = url.indexOf('/system_config/edit/'),
+		baseUrl = url.substring(0, position);
+	
+	$.getJSON(baseUrl + '/algoliasearch_queue', function(queueInfo) {
+		var message = '<span style="font-size: 25px; position: relative; top: 5px;">⚠</span> ' +
+			'<strong style="font-size: 1.15em;"><a href="https://community.algolia.com/magento/doc/m1/indexing-queue/?utm_source=magento&utm_medium=extension&utm_campaign=magento_1&utm_term=shop-owner&utm_content=doc-link#general-information" target="_blank">Indexing queue</a> is not enabled</strong><br>' +
+			'It\'s highly recommended to enable it, especially if you are on production environment. ' +
+			'You can learn how to enable the index queue in the documentation: <a href="https://community.algolia.com/magento/doc/m1/indexing-queue/?utm_source=magento&utm_medium=extension&utm_campaign=magento_1&utm_term=shop-owner&utm_content=doc-link#general-information" target="_blank">Indexing queue</a>';
+		
+		if (queueInfo.isEnabled === true) {
+			message = '<strong style="font-size: 1.15em;"><a href="https://community.algolia.com/magento/doc/m1/indexing-queue/?utm_source=magento&utm_medium=extension&utm_campaign=magento_1&utm_term=shop-owner&utm_content=doc-link#general-information" target="_blank">Indexing queue</a> information</strong><br>' +
+				'Number of queued jobs: <strong>' + queueInfo.currentSize + '</strong>, ' +
+				'all queued jobs will be processed in appr. <strong>' + queueInfo.eta + '</strong> ' +
+				'<small style="color: #2f2f2f; font-size: .8em;">(assuming your queue runner runs every 5 minutes)</small><br>' +
+				'If you want to clear the queue, hit the button: <button class="algolia_clear_queue">Clear the queue</button><br />' +
+				'<small style="color: #2f2f2f; font-size: .9em; display: inline-block;">' +
+				'More information about how the indexing queue works you can find in the documentation: <a href="https://community.algolia.com/magento/doc/m1/indexing-queue/?utm_source=magento&utm_medium=extension&utm_campaign=magento_1&utm_term=shop-owner&utm_content=doc-link#general-information" target="_blank">Indexing queue</a>' +
+				'</small>';
+		}
+		
+		$('.entry-edit').before('<div style="font-size: 1.1em; line-height: 25px; padding: 3px 8px; border: 1px solid; margin-bottom: 10px; color: #333;">' + message + '</div>');
+	});
+	
+	$(document).on('click', '.algolia_clear_queue', function(e) {
+		e.preventDefault();
+		
+		if (!confirm('Are you sure you want to clear the queue? This operation cannot be reverted.')) {
+			return false;
+		}
+		
+		$(this).replaceWith('<span class="algolia_clearing" style="font-weight: bold;">Clearing the queue <span id="wait"></span></span>');
+		var dots = window.setInterval( function() {
+			var $wait = $('#wait'),
+				waitText = $wait.text();
+			
+			if (waitText.length > 2) {
+				$wait.text('');
+			}
+			else {
+				$wait.text(waitText + '.');
+			}
+		}, 200);
+		
+		$.getJSON(baseUrl + '/algoliasearch_queue/truncate', function(payload) {
+			window.clearInterval(dots);
+			
+			if (payload.status === 'ok') {
+				$('.algolia_clearing').replaceWith('<span class="algolia_cleared" style="font-weight: bold; color: darkgreen;">The queue has been cleared</span>');
+			}
+			else {
+				$('.algolia_clearing').replaceWith('<span class="algolia_clear_errored" style="font-weight: bold; color: darkred;">There was an error during clearing the queue - <i>'+payload.message+'</i></span>');
+			}
+		});
+		
+		return false;
 	});
 
 	function compareVersion(left, right) {

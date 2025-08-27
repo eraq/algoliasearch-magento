@@ -30,7 +30,9 @@ class Algolia_Algoliasearch_Model_Observer
     }
 
     /**
-     * On config save.
+     * On configuration save
+     *
+     * @param Varien_Event_Observer $observer
      */
     public function configSaved(Varien_Event_Observer $observer)
     {
@@ -39,6 +41,11 @@ class Algolia_Algoliasearch_Model_Observer
 
     public function saveSettings($isFullProductReindex = false)
     {
+        if (is_object($isFullProductReindex) && get_class($isFullProductReindex) === 'Varien_Object') {
+            $eventData = $isFullProductReindex->getData();
+            $isFullProductReindex = $eventData['isFullProductReindex'];
+        }
+
         foreach (Mage::app()->getStores() as $store) {/* @var $store Mage_Core_Model_Store */
             if ($store->getIsActive()) {
                 $saveToTmpIndicesToo = ($isFullProductReindex && $this->config->isQueueActive($store->getId()));
@@ -52,38 +59,78 @@ class Algolia_Algoliasearch_Model_Observer
         $req = Mage::app()->getRequest();
 
         if (strpos($req->getPathInfo(), 'system_config/edit/section/algoliasearch') !== false) {
-            $observer->getLayout()->getUpdate()->addHandle('algolia_bundle_handle');
+            $observer->getData('layout')->getUpdate()->addHandle('algolia_bundle_handle');
         }
     }
 
     /**
-     * Call algoliasearch.xml To load js / css / phtml.
+     * Call algoliasearch.xml to load JS / CSS / PHTMLs
+     *
+     * @param Varien_Event_Observer $observer
+     * @return $this
      */
     public function useAlgoliaSearchPopup(Varien_Event_Observer $observer)
     {
-        if ($this->config->isEnabledFrontEnd()) {
-            if ($this->config->getApplicationID() && $this->config->getAPIKey()) {
-                if ($this->config->isPopupEnabled() || $this->config->isInstantEnabled()) {
-                    $observer->getLayout()->getUpdate()->addHandle('algolia_search_handle');
-
-                    if ($this->config->isDefaultSelector()) {
-                        $observer->getLayout()->getUpdate()->addHandle('algolia_search_handle_with_topsearch');
-                    } else {
-                        $observer->getLayout()->getUpdate()->addHandle('algolia_search_handle_no_topsearch');
-                    }
-                }
-            }
+        if (!$this->config->isEnabledFrontEnd()) {
+            return $this;
         }
+
+        if (!$this->config->getApplicationID() || !$this->config->getAPIKey()) {
+            return $this;
+        }
+
+        $this->loadAlgoliasearchHandle($observer);
+
+        $this->loadSearchFormHandle($observer);
+
+        $this->loadInstantSearchHandle($observer);
+
+        $this->loadAutocompleteHandle($observer);
+
+        $this->loadPreventBackendRenderingHandle($observer);
+
+        $this->loadAnalyticsHandle($observer);
 
         return $this;
     }
 
     public function saveProduct(Varien_Event_Observer $observer)
     {
+        if ($this->isIndexerInManualMode('algolia_search_indexer')) {
+            return;
+        }
+
         $product = $observer->getDataObject();
         $product = Mage::getModel('catalog/product')->load($product->getId());
 
         Algolia_Algoliasearch_Model_Indexer_Algolia::$product_categories[$product->getId()] = $product->getCategoryIds();
+    }
+
+    /**
+     * @event cms_page_save_commit_after
+     * @param Varien_Event_Observer $observer
+     */
+    public function savePage(Varien_Event_Observer $observer)
+    {
+        if (!$this->config->getApplicationID()
+            || !$this->config->getAPIKey()
+            || $this->isIndexerInManualMode('algolia_search_indexer_pages')) {
+            return;
+        }
+
+        /** @var Mage_Cms_Model_Page $page */
+        $page = $observer->getEvent()->getDataObject();
+        $storeIds = $page->getStores();
+
+        /** @var Algolia_Algoliasearch_Model_Resource_Engine $engine */
+        $engine = Mage::getResourceModel('algoliasearch/engine');
+
+        foreach ($storeIds as $storeId) {
+            if ($storeId == 0) {
+                $storeId = null;
+            }
+            $engine->rebuildPages($storeId, array($page->getPageId()));
+        }
     }
 
     public function deleteProductsStoreIndices(Varien_Object $event)
@@ -118,8 +165,9 @@ class Algolia_Algoliasearch_Model_Observer
     public function rebuildPageIndex(Varien_Object $event)
     {
         $storeId = $event->getStoreId();
+        $pageIds = $event->getPageIds();
 
-        $this->helper->rebuildStorePageIndex($storeId);
+        $this->helper->rebuildStorePageIndex($storeId, $pageIds);
     }
 
     public function rebuildSuggestionIndex(Varien_Object $event)
@@ -219,5 +267,79 @@ class Algolia_Algoliasearch_Model_Observer
         $storeId = $event->getStoreId();
 
         $this->helper->moveProductsIndex($storeId);
+    }
+
+    private function loadAlgoliasearchHandle(Varien_Event_Observer $observer)
+    {
+        if (!$this->config->isPopupEnabled() && !$this->config->isInstantEnabled()) {
+            return;
+        }
+
+        $observer->getData('layout')->getUpdate()->addHandle('algolia_search_handle');
+    }
+
+    private function loadSearchFormHandle(Varien_Event_Observer $observer)
+    {
+        if (!$this->config->isDefaultSelector()) {
+            return;
+        }
+
+        $observer->getData('layout')->getUpdate()->addHandle('algolia_search_handle_with_topsearch');
+    }
+
+    private function loadInstantSearchHandle(Varien_Event_Observer $observer)
+    {
+        if (!$this->config->isInstantEnabled()) {
+            return;
+        }
+
+        $category = Mage::registry('current_category');
+        if ($this->config->replaceCategories() && $category && $category->getDisplayMode() === 'PAGE') {
+            return;
+        }
+
+        $observer->getData('layout')->getUpdate()->addHandle('algolia_search_handle_instantsearch');
+    }
+
+    private function loadAutocompleteHandle(Varien_Event_Observer $observer)
+    {
+        if ($this->config->isPopupEnabled()) {
+            $observer->getData('layout')->getUpdate()->addHandle('algolia_search_handle_autocomplete');
+        }
+    }
+
+    private function loadPreventBackendRenderingHandle(Varien_Event_Observer $observer)
+    {
+        if (!$this->config->preventBackendRendering()) {
+            return;
+        }
+
+        $category = Mage::registry('current_category');
+        $backendRenderingDisplayMode = $this->config->getBackendRenderingDisplayMode();
+        if ($category && $backendRenderingDisplayMode === 'only_products' && $category->getDisplayMode() === 'PAGE') {
+            return;
+        }
+
+        $observer->getData('layout')->getUpdate() ->addHandle('algolia_search_handle_prevent_backend_rendering');
+    }
+
+    private function loadAnalyticsHandle(Varien_Event_Observer $observer)
+    {
+        if (!$this->config->isClickConversionAnalyticsEnabled()) {
+            return;
+        }
+
+        $observer->getData('layout')->getUpdate()->addHandle('algolia_search_handle_click_conversion_analytics');
+    }
+
+    private function isIndexerInManualMode($indexerCode)
+    {
+        /** @var $process Mage_Index_Model_Process */
+        $process = Mage::getModel('index/process')->load($indexerCode, 'indexer_code');
+        if (!is_null($process) && $process->getMode() == Mage_Index_Model_Process::MODE_MANUAL) {
+            return true;
+        }
+
+        return false;
     }
 }

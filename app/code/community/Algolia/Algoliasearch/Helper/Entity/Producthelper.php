@@ -1,7 +1,11 @@
 <?php
 
+use AlgoliaSearch\AlgoliaException;
+
 class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algoliasearch_Helper_Entity_Helper
 {
+    private $compositeTypes;
+
     protected static $_productAttributes;
     protected static $_currencies;
 
@@ -151,16 +155,16 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
 
         $products = $products->setStoreId($storeId);
         $products = $products->addStoreFilter($storeId);
+        $products = $products->distinct(true);
 
         if ($productIds && count($productIds) > 0) {
             $products = $products->addAttributeToFilter('entity_id', array('in' => $productIds));
         }
 
         if ($only_visible) {
-            /** @var Mage_Catalog_Model_Product_Visibility $catalog_productVisibility */
-            $catalog_productVisibility = Mage::getSingleton('catalog/product_visibility');
+            $visibilityAttributeValues = $this->getVisibilityAttributeValues($storeId);
 
-            $products = $products->addAttributeToFilter('visibility', array('in' => $catalog_productVisibility->getVisibleInSiteIds()));
+            $products = $products->addAttributeToFilter('visibility', array('in' => $visibilityAttributeValues));
             $products = $products->addAttributeToFilter('status', Mage_Catalog_Model_Product_Status::STATUS_ENABLED);
         }
 
@@ -230,7 +234,7 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
 
         $customRankingAttributes = array();
 
-        $facets = $this->config->getFacets();
+        $facets = $this->config->getFacets($storeId);
 
         /** @var Mage_Directory_Model_Currency $directoryCurrency */
         $directoryCurrency = Mage::getModel('directory/currency');
@@ -253,7 +257,12 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
                     $attributesForFaceting[] = $facet['attribute'];
                 }
             } else {
-                $attributesForFaceting[] = $facet['attribute'];
+                $attribute = $facet['attribute'];
+                if (array_key_exists('searchable', $facet) && $facet['searchable'] === '1') {
+                    $attribute = 'searchable('.$attribute.')';
+                }
+
+                $attributesForFaceting[] = $attribute;
             }
         }
 
@@ -289,14 +298,19 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
             $this->algolia_helper->setSettings($indexName.'_tmp', $mergeSettings);
         }
 
+        $this->setFacetsQueryRules($indexName);
+        if ($saveToTmpIndicesToo === true) {
+            $this->setFacetsQueryRules($indexName.'_tmp');
+        }
+
         /*
          * Handle replicas
          */
-        $sorting_indices = $this->config->getSortingIndices();
+        $sorting_indices = $this->config->getSortingIndices($storeId);
+
+        $replicas = array();
 
         if (count($sorting_indices) > 0) {
-            $replicas = array();
-
             foreach ($sorting_indices as $values) {
                 if ($this->config->isCustomerGroupsEnabled($storeId) && $values['attribute'] === 'price') {
                     foreach ($groups = Mage::getModel('customer/group')->getCollection() as $group) {
@@ -315,7 +329,24 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
                 }
             }
 
+            // Merge current replicas with sorting replicas to not delete A/B testing replica indices
+            try {
+                $currentSettings = $this->algolia_helper->getSettings($indexName);
+                if (array_key_exists('replicas', $currentSettings)) {
+                    $replicas = array_values(array_unique(array_merge($replicas, $currentSettings['replicas'])));
+                }
+            } catch (\AlgoliaSearch\AlgoliaException $e) {
+                if ($e->getMessage() !== 'Index does not exist') {
+                    throw $e;
+                }
+            }
+
             $this->algolia_helper->setSettings($this->getIndexName($storeId), array('replicas' => $replicas));
+            // $setReplicasTaskId = $this->algolia_helper->getLastTaskId();
+
+            /** @var Mage_Core_Model_Store $store */
+            $store = Mage::getModel('core/store')->load($storeId);
+            $baseCurrencyCode = $store->getBaseCurrencyCode();
 
             foreach ($sorting_indices as $values) {
                 if ($this->config->isCustomerGroupsEnabled($storeId) && $values['attribute'] === 'price') {
@@ -324,13 +355,14 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
 
                         $suffix_index_name = 'group_'.$group_id;
 
-                        $sort_attribute = $values['attribute'] === 'price' ? $values['attribute'].'.'.$currencies[0].'.'.$suffix_index_name : $values['attribute'];
+                        $sort_attribute = $values['attribute'] === 'price' ? $values['attribute'].'.'.$baseCurrencyCode.'.'.$suffix_index_name : $values['attribute'];
 
                         $mergeSettings['ranking'] = array(
                             $values['sort'].'('.$sort_attribute.')',
                             'typo',
                             'geo',
                             'words',
+                            'filters',
                             'proximity',
                             'attribute',
                             'exact',
@@ -341,13 +373,14 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
                             $mergeSettings);
                     }
                 } else {
-                    $sort_attribute = $values['attribute'] === 'price' ? $values['attribute'].'.'.$currencies[0].'.'.'default' : $values['attribute'];
+                    $sort_attribute = $values['attribute'] === 'price' ? $values['attribute'].'.'.$baseCurrencyCode.'.'.'default' : $values['attribute'];
 
                     $mergeSettings['ranking'] = array(
                         $values['sort'].'('.$sort_attribute.')',
                         'typo',
                         'geo',
                         'words',
+                        'filters',
                         'proximity',
                         'attribute',
                         'exact',
@@ -363,7 +396,13 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
                     }
                 }
             }
+        } else {
+            $this->algolia_helper->setSettings($this->getIndexName($storeId), array('replicas' => $replicas));
+            // $setReplicasTaskId = $this->algolia_helper->getLastTaskId();
         }
+
+        // Commented out as it doesn't delete anything now because of merging replica indices earlier
+        // $this->deleteUnusedReplicas($indexName, $replicas, $setReplicasTaskId);
 
         if ($this->config->isEnabledSynonyms($storeId) === true) {
             if ($synonymsFile = $this->config->getSynonymsFile($storeId)) {
@@ -402,6 +441,21 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
             $this->algolia_helper->setSynonyms($this->getIndexName($storeId, $saveToTmpIndicesToo), $synonymsToSet);
         } elseif ($saveToTmpIndicesToo === true) {
             $this->algolia_helper->copySynonyms($this->getIndexName($storeId), $this->getIndexName($storeId, $saveToTmpIndicesToo));
+        }
+
+        if ($saveToTmpIndicesToo === true) {
+            $indexName = $this->getIndexName($storeId);
+            $indexNameTmp = $this->getIndexName($storeId, $saveToTmpIndicesToo);
+
+            try {
+                $this->algolia_helper->copyQueryRules($indexName, $indexNameTmp);
+            } catch (AlgoliaException $e) {
+                // Fail silently if query rules are disabled on the app
+                // If QRs are disabled, nothing will happen and the extension will work as expected
+                if ($e->getMessage() !== 'Query Rules are not enabled on this application') {
+                    throw $e;
+                }
+            }
         }
     }
 
@@ -451,6 +505,13 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
         $directoryCurrency = Mage::getModel('directory/currency');
         $currencies = $directoryCurrency->getConfigAllowCurrencies();
 
+        if (Mage::helper('core')->isModuleEnabled('Mage_Weee') &&
+            Mage::helper('weee')->getPriceDisplayType($product->getStore()) == 0) {
+            $weeeTaxAmount = Mage::helper('weee')->getAmountForDisplay($product);
+        } else {
+            $weeeTaxAmount = 0;
+        }
+
         $baseCurrencyCode = $store->getBaseCurrencyCode();
 
         $groups = array();
@@ -473,12 +534,14 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
 
                 $price = (double) $taxHelper->getPrice($product, $product->getPrice(), $with_tax, null, null, null, $product->getStore(), null);
                 $price = $directoryHelper->currencyConvert($price, $baseCurrencyCode, $currency_code);
+                $price += $weeeTaxAmount;
 
                 $customData[$field][$currency_code]['default'] = $price;
                 $customData[$field][$currency_code]['default_formated'] = $this->formatPrice($price, false, $currency_code);
 
                 $special_price = (double) $taxHelper->getPrice($product, $product->getFinalPrice(), $with_tax, null, null, null, $product->getStore(), null);
                 $special_price = $directoryHelper->currencyConvert($special_price, $baseCurrencyCode, $currency_code);
+                $special_price += $weeeTaxAmount;
 
                 if ($customer_groups_enabled) {
                     // If fetch special price for groups
@@ -489,6 +552,7 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
 
                         $discounted_price = $product->getPriceModel()->getFinalPrice(1, $product);
                         $discounted_price = $directoryHelper->currencyConvert($discounted_price, $baseCurrencyCode, $currency_code);
+                        $discounted_price += $weeeTaxAmount;
 
                         if ($discounted_price !== false) {
                             $customData[$field][$currency_code]['group_'.$group_id] = (double) $taxHelper->getPrice($product,
@@ -519,24 +583,32 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
                         $group_id = (int) $group->getData('customer_group_id');
 
                         if ($special_price && $special_price < $customData[$field][$currency_code]['group_'.$group_id]) {
-                            $customData[$field][$currency_code]['group_'.$group_id.'_original_formated'] = $customData[$field][$currency_code]['default_formated'];
+                            $customData[$field][$currency_code]['group_'.$group_id.'_original_formated'] =
+                                $customData[$field][$currency_code]['default_formated'];
 
                             $customData[$field][$currency_code]['group_'.$group_id] = $special_price;
-                            $customData[$field][$currency_code]['group_'.$group_id.'_formated'] = $this->formatPrice($special_price,
-                                false, $currency_code);
+                            $customData[$field][$currency_code]['group_'.$group_id.'_formated'] = $this->formatPrice(
+                                $special_price,
+                                false,
+                                $currency_code
+                            );
                         }
-                    }
-                } else {
-                    if ($special_price && $special_price < $customData[$field][$currency_code]['default']) {
-                        $customData[$field][$currency_code]['default_original_formated'] = $customData[$field][$currency_code]['default_formated'];
-
-                        $customData[$field][$currency_code]['default'] = $special_price;
-                        $customData[$field][$currency_code]['default_formated'] = $this->formatPrice($special_price,
-                            false, $currency_code);
                     }
                 }
 
-                if ($type == 'grouped' || $type == 'bundle') {
+                if ($special_price && $special_price < $customData[$field][$currency_code]['default']) {
+                    $customData[$field][$currency_code]['default_original_formated'] =
+                        $customData[$field][$currency_code]['default_formated'];
+
+                    $customData[$field][$currency_code]['default'] = $special_price;
+                    $customData[$field][$currency_code]['default_formated'] = $this->formatPrice(
+                        $special_price,
+                        false,
+                        $currency_code
+                    );
+                }
+
+                if ($type == 'grouped' || $type == 'bundle' || $type == 'configurable') {
                     $min = PHP_INT_MAX;
                     $max = 0;
 
@@ -546,20 +618,24 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
                         list($min, $max) = $_priceModel->getTotalPrices($product, null, $with_tax, true);
                         $min = (double) $min;
                         $max = (double) $max;
-                    }
-
-                    if ($type == 'grouped') {
+                    } else {
                         if (count($sub_products) > 0) {
                             foreach ($sub_products as $sub_product) {
+                                if (!$sub_product->isSalable()) {
+                                    continue;
+                                }
+
                                 $price = (double) $taxHelper->getPrice($product, $sub_product->getFinalPrice(), $with_tax,
                                                          null, null, null, $product->getStore(), null);
 
                                 $min = min($min, $price);
                                 $max = max($max, $price);
                             }
-                        } else {
+                        }
+
+                        if ($min > $max) {
                             $min = $max;
-                        } // avoid to have PHP_INT_MAX in case of no subproducts (Corner case of visibility and stock options)
+                        } // avoid to have PHP_INT_MAX in case of no salable subproducts (Corner case of visibility and stock options)
                     }
 
                     if ($min != $max) {
@@ -656,7 +732,7 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
         $customData = array(
             'objectID'           => $product->getId(),
             'name'               => $product->getName(),
-            'url'                => $product->getProductUrl(),
+            'url'                => $product->getProductUrl(false),
             'visibility_search'  => (int) (in_array($visibility, $visibleInSearch)),
             'visibility_catalog' => (int) (in_array($visibility, $visibleInCatalog)),
         );
@@ -674,9 +750,12 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
         $_categoryIds = $product->getCategoryIds();
 
         if (is_array($_categoryIds) && count($_categoryIds) > 0) {
-            $categoryCollection = Mage::getResourceModel('catalog/category_collection')->addAttributeToSelect('name')
+            $categoryCollection = Mage::getResourceModel('catalog/category_collection')
+                                      ->distinct(true)
+                                      ->addAttributeToSelect('name')
                                       ->addAttributeToFilter('entity_id', $_categoryIds)
-                                      ->addFieldToFilter('level', array('gt' => 1))->addIsActiveFilter();
+                                      ->addFieldToFilter('level', array('gt' => 1))
+                                      ->addIsActiveFilter();
 
             if ($this->config->showCatsNotIncludedInNavigation($product->getStoreId()) == false) {
                 $categoryCollection->addAttributeToFilter('include_in_menu', '1');
@@ -880,7 +959,7 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
 
         foreach ($additionalAttributes as $attribute) {
             $attribute_name = $attribute['attribute'];
-            if (isset($customData[$attribute_name])) {
+            if (array_key_exists($attribute_name, $customData)) {
                 continue;
             }
 
@@ -892,15 +971,16 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
             if ($attribute_resource) {
                 $attribute_resource->setStoreId($product->getStoreId());
 
+                $values = array();
+                $subProductImages = array();
+
                 /**
                  * if $value is missing or if the attribute is SKU,
                  * use values from child products.
                  */
                 if (($value === null || 'sku' == $attribute_name) && ($type == 'configurable' || $type == 'grouped' || $type == 'bundle')) {
-                    if ($value === null) {
-                        $values = array();
-                    } else {
-                        $values = array($this->getValueOrValueText($product, $attribute_name, $attribute_resource));
+                    if ($value !== null) {
+                        $values[] = $this->getValueOrValueText($product, $attribute_name, $attribute_resource);
                     }
 
                     $all_sub_products_out_of_stock = true;
@@ -918,13 +998,33 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
                             $value = $sub_product->getData($attribute_name);
 
                             if ($value) {
-                                $values[] = $this->getValueOrValueText($sub_product, $attribute_name, $attribute_resource);
+                                $textValue = $this->getValueOrValueText($sub_product, $attribute_name, $attribute_resource);
+
+                                $values[] = $textValue;
+
+                                if (mb_strtolower($attribute_name, 'utf-8') === 'color') {
+                                    $image = $imageHelper->init($sub_product, $this->config->getImageType())
+                                                         ->resize($this->config->getImageWidth(),
+                                                             $this->config->getImageHeight());
+
+                                    try {
+                                        $textValueInLower = mb_strtolower($textValue, 'utf-8');
+                                        $subProductImages[$textValueInLower] = $image->toString();
+                                    } catch (\Exception $e) {
+                                        $this->logger->log($e->getMessage());
+                                        $this->logger->log($e->getTraceAsString());
+                                    }
+                                }
                             }
                         }
                     }
 
                     if (is_array($values) && count($values) > 0) {
                         $customData[$attribute_name] = array_values(array_unique($values, SORT_REGULAR));
+                    }
+
+                    if (empty($subProductImages) === false) {
+                        $customData['images_data'] = $subProductImages;
                     }
 
                     // Set main product out of stock if all
@@ -953,7 +1053,7 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
 
         // Only for backward compatibility
         $transport = new Varien_Object($customData);
-        Mage::dispatchEvent('algolia_subproducts_index', array('custom_data' => $transport, 'sub_products' => $sub_products));
+        Mage::dispatchEvent('algolia_subproducts_index', array('custom_data' => $transport, 'sub_products' => $sub_products, 'productObject' => $product));
         $customData = $transport->getData();
 
         $customData = array_merge($customData, $defaultData);
@@ -965,7 +1065,7 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
         $customData = $this->clearNoValues($customData);
 
         $transport = new Varien_Object($customData);
-        Mage::dispatchEvent('algolia_after_create_product_object', array('product_data' => $transport, 'sub_products' => $sub_products));
+        Mage::dispatchEvent('algolia_after_create_product_object', array('product_data' => $transport, 'sub_products' => $sub_products, 'productObject' => $product));
         $customData = $transport->getData();
 
         $this->logger->stop('CREATE RECORD '.$product->getId().' '.$this->logger->getStoreName($product->storeId));
@@ -973,6 +1073,46 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
         return $customData;
     }
 
+    /**
+     * Returns all parent product IDs, e.g. when simple product is part of configurable or bundle
+     *
+     * @param array $productIds
+     * @return array
+     */
+    public function getParentProductIds(array $productIds)
+    {
+        $parentIds = array();
+        foreach ($this->getCompositeTypes() as $typeInstance) {
+            $parentIds = array_merge($parentIds, $typeInstance->getParentIdsByChild($productIds));
+        }
+
+        return $parentIds;
+    }
+
+    /**
+     * Returns composite product type instances
+     *
+     * @return Mage_Catalog_Model_Product_Type[]
+     *
+     * @see Mage_Catalog_Model_Resource_Product_Flat_Indexer::getProductTypeInstances()
+     */
+    private function getCompositeTypes()
+    {
+        if ($this->compositeTypes === null) {
+            /** @var Mage_Catalog_Model_Product $productEmulator */
+            $productEmulator = Mage::getModel('catalog/product');
+
+            /** @var Mage_Catalog_Model_Product_Type $productType */
+            $productType = Mage::getModel('catalog/product_type');
+            foreach ($productType->getCompositeTypes() as $typeId) {
+                $productEmulator->setTypeId($typeId);
+                $this->compositeTypes[$typeId] = $productType->factory($productEmulator);
+            }
+        }
+
+        return $this->compositeTypes;
+    }
+    
     public function getAllProductIds($storeId)
     {
         $products = Mage::getModel('catalog/product')->getCollection();
@@ -981,6 +1121,78 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
         $products = $products->addStoreFilter($storeId);
 
         return $products->getAllIds();
+    }
+
+    public function shouldIndexProductByItsVisibility(Mage_Catalog_Model_Product $product, $storeId)
+    {
+        $productVisibility = (int) $product->getVisibility();
+        $indexVisibility = $this->config->indexVisibility($storeId);
+
+        $shouldIndex = ($productVisibility > Mage_Catalog_Model_Product_Visibility::VISIBILITY_NOT_VISIBLE);
+
+        if ($indexVisibility === 'only_search') {
+            $shouldIndex = ($productVisibility === Mage_Catalog_Model_Product_Visibility::VISIBILITY_IN_SEARCH || $productVisibility === Mage_Catalog_Model_Product_Visibility::VISIBILITY_BOTH);
+        } elseif ($indexVisibility === 'only_catalog') {
+            $shouldIndex = ($productVisibility === Mage_Catalog_Model_Product_Visibility::VISIBILITY_IN_CATALOG || $productVisibility === Mage_Catalog_Model_Product_Visibility::VISIBILITY_BOTH);
+        }
+
+        return $shouldIndex;
+    }
+
+    private function getVisibilityAttributeValues($storeId)
+    {
+        $indexVisibility = $this->config->indexVisibility($storeId);
+
+        /** @var Mage_Catalog_Model_Product_Visibility $catalog_productVisibility */
+        $catalog_productVisibility = Mage::getSingleton('catalog/product_visibility');
+
+        $visibilityMethod = 'getVisibleInSiteIds';
+        if ($indexVisibility === 'only_search') {
+            $visibilityMethod = 'getVisibleInSearchIds';
+        } elseif ($indexVisibility === 'only_catalog') {
+            $visibilityMethod = 'getVisibleInCatalogIds';
+        }
+
+        return $catalog_productVisibility->{$visibilityMethod}();
+    }
+
+    /**
+     * Check if product can be index on Algolia
+     *
+     * @param Mage_Catalog_Model_Product $product
+     * @param int     $storeId
+     *
+     * @return bool
+     *
+     */
+    public function canProductBeReindexed(Mage_Catalog_Model_Product $product, $storeId)
+    {
+        if ($product->isDeleted() === true) {
+            throw (new Algolia_Algoliasearch_Model_Exception_ProductDeletedException())
+                ->withProduct($product)
+                ->withStoreId($storeId);
+        }
+
+        if ($product->getStatus() == Mage_Catalog_Model_Product_Status::STATUS_DISABLED) {
+            throw (new Algolia_Algoliasearch_Model_Exception_ProductDisabledException())
+                ->withProduct($product)
+                ->withStoreId($storeId);
+        }
+
+        if ($this->shouldIndexProductByItsVisibility($product, $storeId) === false) {
+            throw (new Algolia_Algoliasearch_Model_Exception_ProductNotVisibleException())
+                ->withProduct($product)
+                ->withStoreId($storeId);
+        }
+
+        if (!$this->config->getShowOutOfStock($storeId)
+            && !$product->getStockItem()->getIsInStock()) {
+            throw (new Algolia_Algoliasearch_Model_Exception_ProductOutOfStockException())
+                ->withProduct($product)
+                ->withStoreId($storeId);
+        }
+
+        return true;
     }
 
     private function explodeSynomyms($synonyms)
@@ -1010,5 +1222,95 @@ class Algolia_Algoliasearch_Helper_Entity_Producthelper extends Algolia_Algolias
         }
 
         return $customData;
+    }
+
+    private function deleteUnusedReplicas($indexName, $replicas, $setReplicasTaskId)
+    {
+        $indicesToDelete = array();
+
+        $allIndices = $this->algolia_helper->listIndexes();
+        foreach ($allIndices['items'] as $indexInfo) {
+            if (strpos($indexInfo['name'], $indexName) !== 0 || $indexInfo['name'] === $indexName) {
+                continue;
+            }
+            // Do not delete tmp indices which are used for indexing jobs
+            if (strpos($indexInfo['name'], '_tmp') === false && in_array($indexInfo['name'], $replicas) === false) {
+                $indicesToDelete[] = $indexInfo['name'];
+            }
+        }
+
+        if (count($indicesToDelete) > 0) {
+            $this->algolia_helper->waitLastTask($indexName, $setReplicasTaskId);
+
+            foreach ($indicesToDelete as $indexToDelete) {
+                $this->algolia_helper->deleteIndex($indexToDelete);
+            }
+        }
+    }
+
+    private function setFacetsQueryRules($indexName)
+    {
+        $index = $this->algolia_helper->getIndex($indexName);
+
+        $this->clearFacetsQueryRules($index);
+
+        $rules = array();
+        $facets = $this->config->getFacets();
+        foreach ($facets as $facet) {
+            if (!array_key_exists('create_rule', $facet) || $facet['create_rule'] !== '1') {
+                continue;
+            }
+
+            $attribute = $facet['attribute'];
+
+            $rules[] = array(
+                'objectID' => 'filter_'.$attribute,
+                'description' => 'Filter facet "'.$attribute.'"',
+                'condition' => array(
+                    'anchoring' => 'contains',
+                    'pattern' => '{facet:'.$attribute.'}',
+                    'context' => 'magento_filters',
+                ),
+                'consequence' => array(
+                    'params' => array(
+                        'automaticFacetFilters' => array($attribute),
+                        'query' => array(
+                            'remove' => array('{facet:'.$attribute.'}')
+                        )
+                    ),
+                )
+            );
+        }
+
+        if ($rules) {
+            $index->batchRules($rules, true);
+        }
+    }
+
+    private function clearFacetsQueryRules($index)
+    {
+        try {
+            $hitsPerPage = 100;
+            $page = 0;
+            do {
+                $fetchedQueryRules = $index->searchRules(array(
+                        'context' => 'magento_filters',
+                        'page' => $page,
+                        'hitsPerPage' => $hitsPerPage,
+                    ));
+
+                foreach ($fetchedQueryRules['hits'] as $hit) {
+                    $index->deleteRule($hit['objectID'], true);
+                }
+
+                $page++;
+            } while (($page * $hitsPerPage) < $fetchedQueryRules['nbHits']);
+        } catch (AlgoliaException $e) {
+            // Fail silently if query rules are disabled on the app
+            // If QRs are disabled, nothing will happen and the extension will work as expected
+            if ($e->getMessage() !== 'Query Rules are not enabled on this application') {
+                throw $e;
+            }
+        }
     }
 }

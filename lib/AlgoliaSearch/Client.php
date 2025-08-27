@@ -37,6 +37,7 @@ class Client
     const CAINFO = 'cainfo';
     const CURLOPT = 'curloptions';
     const PLACES_ENABLED = 'placesEnabled';
+    const FAILING_HOSTS_CACHE = 'failingHostsCache';
 
     /**
      * @var ClientContext
@@ -94,12 +95,26 @@ class Client
                 case self::PLACES_ENABLED:
                     $this->placesEnabled = (bool) $value;
                     break;
+                case self::FAILING_HOSTS_CACHE:
+                    if (! $value instanceof FailingHostsCache) {
+                        throw new \InvalidArgumentException(
+                            'failingHostsCache must be an instance of \AlgoliaSearch\FailingHostsCache.'
+                        );
+                    }
+                    break;
                 default:
                     throw new \Exception('Unknown option: '.$option);
             }
         }
 
-        $this->context = new ClientContext($applicationID, $apiKey, $hostsArray, $this->placesEnabled);
+        $failingHostsCache = isset($options[self::FAILING_HOSTS_CACHE]) ? $options[self::FAILING_HOSTS_CACHE] : null;
+        $this->context = new ClientContext(
+            $applicationID,
+            $apiKey,
+            $hostsArray,
+            $this->placesEnabled,
+            $failingHostsCache
+        );
     }
 
     /**
@@ -121,15 +136,16 @@ class Client
      */
     public function setConnectTimeout($connectTimeout, $timeout = 30, $searchTimeout = 5)
     {
-        $version = curl_version();
-        $isPhpOld = version_compare(phpversion(), '5.2.3', '<');
-        $isCurlOld = version_compare($version['version'], '7.16.2', '<');
+        if ($connectTimeout < 1) {
+            $version = curl_version();
 
-        if (($isPhpOld || $isCurlOld) && $this->context->connectTimeout < 1) {
-            throw new AlgoliaException(
-                "The timeout can't be a float with a PHP version less than 5.2.3 or a curl version less than 7.16.2"
-            );
+            if (version_compare($version['version'], '7.16.2', '<')) {
+                throw new AlgoliaException(
+                    "The timeout can't be a float with a curl version less than 7.16.2"
+                );
+            }
         }
+
         $this->context->connectTimeout = $connectTimeout;
         $this->context->readTimeout = $timeout;
         $this->context->searchTimeout = $searchTimeout;
@@ -215,12 +231,39 @@ class Client
         $this->context->setExtraHeader($key, $value);
     }
 
+    public function waitTask($indexName, $taskID, $timeBeforeRetry = 100, $requestHeaders = array())
+    {
+        while (true) {
+            $res = $this->getTaskStatus($indexName, $taskID, $requestHeaders);
+            if ($res['status'] === 'published') {
+                return $res;
+            }
+            usleep($timeBeforeRetry * 1000);
+        }
+    }
+
+    public function getTaskStatus($indexName, $taskID, $requestHeaders = array())
+    {
+        return $this->request(
+            $this->context,
+            'GET',
+            sprintf('/1/indexes/%s/task/%s', urlencode($indexName), urlencode($taskID)),
+            null,
+            null,
+            $this->context->readHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
     /**
      * This method allows to query multiple indexes with one API call.
      *
      * @param array  $queries
      * @param string $indexNameKey
      * @param string $strategy
+     * @param array $requestHeaders
      *
      * @return mixed
      *
@@ -229,17 +272,20 @@ class Client
      */
     public function multipleQueries($queries, $indexNameKey = 'indexName', $strategy = 'none')
     {
-        if ($queries == null) {
+        $requestHeaders = func_num_args() === 4 && is_array(func_get_arg(3)) ? func_get_arg(3) : array();
+
+        if ($queries === null) {
             throw new \Exception('No query provided');
         }
         $requests = array();
         foreach ($queries as $query) {
-            if (array_key_exists($indexNameKey, $query)) {
-                $indexes = $query[$indexNameKey];
-                unset($query[$indexNameKey]);
-            } else {
+            if (!array_key_exists($indexNameKey, $query)) {
                 throw new \Exception('indexName is mandatory');
             }
+
+            $indexes = $query[$indexNameKey];
+            unset($query[$indexNameKey]);
+
             $req = array('indexName' => $indexes, 'params' => $this->buildQuery($query));
 
             array_push($requests, $req);
@@ -251,6 +297,33 @@ class Client
             '/1/indexes/*/queries',
             array(),
             array('requests' => $requests, 'strategy' => $strategy),
+            $this->context->readHostsArray,
+            $this->context->connectTimeout,
+            $this->context->searchTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * This method allows to get multiple objects from indexes with one API call.
+     *
+     * @param array  $queries
+     * @param string $indexNameKey
+     * @param string $objectIdKey
+     *
+     * @return mixed
+     *
+     * @throws AlgoliaException
+     * @throws \Exception
+     */
+    public function multipleGetObjects($requests, $requestOptions = array())
+    {
+        return $this->request(
+            $this->context,
+            'POST',
+            '/1/indexes/*/objects',
+            array(),
+            array('requests' => $requests),
             $this->context->readHostsArray,
             $this->context->connectTimeout,
             $this->context->searchTimeout
@@ -273,6 +346,8 @@ class Client
      */
     public function listIndexes()
     {
+        $requestHeaders = func_num_args() === 1 && is_array(func_get_arg(0)) ? func_get_arg(0) : array();
+
         return $this->request(
             $this->context,
             'GET',
@@ -281,7 +356,8 @@ class Client
             null,
             $this->context->readHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
@@ -294,6 +370,8 @@ class Client
      */
     public function deleteIndex($indexName)
     {
+        $requestHeaders = func_num_args() === 2 && is_array(func_get_arg(1)) ? func_get_arg(1) : array();
+
         return $this->request(
             $this->context,
             'DELETE',
@@ -302,7 +380,8 @@ class Client
             null,
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
@@ -317,6 +396,8 @@ class Client
      */
     public function moveIndex($srcIndexName, $dstIndexName)
     {
+        $requestHeaders = func_num_args() === 3 && is_array(func_get_arg(2)) ? func_get_arg(2) : array();
+
         $request = array('operation' => 'move', 'destination' => $dstIndexName);
 
         return $this->request(
@@ -327,7 +408,8 @@ class Client
             $request,
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
@@ -342,7 +424,35 @@ class Client
      */
     public function copyIndex($srcIndexName, $dstIndexName)
     {
-        $request = array('operation' => 'copy', 'destination' => $dstIndexName);
+        $requestHeaders = func_num_args() === 3 && is_array(func_get_arg(2)) ? func_get_arg(2) : array();
+
+        return $this->scopedCopyIndex($srcIndexName, $dstIndexName, array(), $requestHeaders);
+    }
+
+    /**
+     * Copy an existing index and define what to copy instead of records:
+     *  - settings
+     *  - synonyms
+     *  - query rules
+     *
+     * By default, everything is copied.
+     *
+     * @param string $srcIndexName the name of index to copy.
+     * @param string $dstIndexName the new index name that will contains a copy of srcIndexName (destination will be overwritten if it already exist).
+     * @param array $scope Resource to copy instead of records: 'settings', 'rules', 'synonyms'
+     * @param array $requestHeaders
+     * @return mixed
+     */
+    public function scopedCopyIndex($srcIndexName, $dstIndexName, array $scope = array(), array $requestHeaders = array())
+    {
+        $request = array(
+            'operation' => 'copy',
+            'destination' => $dstIndexName,
+        );
+
+        if (! empty($scope)) {
+            $request['scope'] = $scope;
+        }
 
         return $this->request(
             $this->context,
@@ -352,7 +462,8 @@ class Client
             $request,
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
@@ -369,6 +480,8 @@ class Client
      */
     public function getLogs($offset = 0, $length = 10, $type = 'all')
     {
+        $requestHeaders = func_num_args() === 4 && is_array(func_get_arg(3)) ? func_get_arg(3) : array();
+
         if (gettype($type) == 'boolean') { //Old prototype onlyError
             if ($type) {
                 $type = 'error';
@@ -385,7 +498,229 @@ class Client
             null,
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * Add a userID to the mapping
+     * @return an object containing a "updatedAt" attribute
+     *
+     * @throws AlgoliaException
+     */
+    public function assignUserID($userID, $clusterName)
+    {
+        $requestHeaders = func_num_args() === 3 && is_array(func_get_arg(2)) ? func_get_arg(2) : array();
+        $requestHeaders["X-Algolia-User-ID"] = $userID;
+
+        $request = array('cluster' => $clusterName);
+
+        return $this->request(
+            $this->context,
+            'POST',
+            '/1/clusters/mapping',
+            null,
+            $request,
+            $this->context->writeHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * Remove a userID from the mapping
+     * @return an object containing a "deletedAt" attribute
+     *
+     * @throws AlgoliaException
+     */
+    public function removeUserID($userID)
+    {
+        $requestHeaders = func_num_args() === 2 && is_array(func_get_arg(1)) ? func_get_arg(1) : array();
+        $requestHeaders["X-Algolia-User-ID"] = $userID;
+
+        return $this->request(
+            $this->context,
+            'DELETE',
+            '/1/clusters/mapping',
+            null,
+            null,
+            $this->context->writeHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * List available cluster in the mapping
+     * return an object in the form:
+     * array(
+     *     "clusters" => array(
+     *         array("clusterName" => "name", "nbRecords" => 0, "nbUserIDs" => 0, "dataSize" => 0)
+     *     )
+     * ).
+     *
+     * @return mixed
+     * @throws AlgoliaException
+     */
+    public function listClusters()
+    {
+        $requestHeaders = func_num_args() === 1 && is_array(func_get_arg(0)) ? func_get_arg(0) : array();
+
+        return $this->request(
+            $this->context,
+            'GET',
+            '/1/clusters',
+            null,
+            null,
+            $this->context->readHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * Get one userID in the mapping
+     * return an object in the form:
+     * array(
+     *     "userID" => "userName",
+     *     "clusterName" => "name",
+     *     "nbRecords" => 0,
+     *     "dataSize" => 0
+     * ).
+     *
+     * @return mixed
+     * @throws AlgoliaException
+     */
+    public function getUserID($userID)
+    {
+        $requestHeaders = func_num_args() === 2 && is_array(func_get_arg(1)) ? func_get_arg(1) : array();
+
+        return $this->request(
+            $this->context,
+            'GET',
+            '/1/clusters/mapping/'.urlencode($userID),
+            null,
+            null,
+            $this->context->readHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * List userIDs in the mapping
+     * return an object in the form:
+     * array(
+     *     "userIDs" => array(
+     *         array("userID" => "userName", "clusterName" => "name", "nbRecords" => 0, "dataSize" => 0)
+     *     ),
+     *     "page" => 0,
+     *     "hitsPerPage" => 20
+     * ).
+     *
+     * @return mixed
+     * @throws AlgoliaException
+     */
+    public function listUserIDs($page = 0, $hitsPerPage = 20)
+    {
+        $requestHeaders = func_num_args() === 3 && is_array(func_get_arg(2)) ? func_get_arg(2) : array();
+
+        return $this->request(
+            $this->context,
+            'GET',
+            '/1/clusters/mapping?page='.$page.'&hitsPerPage='.$hitsPerPage,
+            null,
+            null,
+            $this->context->readHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * Get top userID in the mapping
+     * return an object in the form:
+     * array(
+     *     "topUsers" => array(
+     *         "clusterName" => array(
+     *             array("userID" => "userName", "nbRecords" => 0, "dataSize" => 0)
+     *         )
+     *     )
+     * ).
+     *
+     * @return mixed
+     * @throws AlgoliaException
+     */
+    public function getTopUserID()
+    {
+        $requestHeaders = func_num_args() === 1 && is_array(func_get_arg(0)) ? func_get_arg(0) : array();
+
+        return $this->request(
+            $this->context,
+            'GET',
+            '/1/clusters/mapping/top',
+            null,
+            null,
+            $this->context->readHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
+        );
+    }
+
+    /**
+     * Search userIDs in the mapping
+     * return an object in the form:
+     * array(
+     *     "hits" => array(
+     *         array("userID" => "userName", "clusterName" => "name", "nbRecords" => 0, "dataSize" => 0)
+     *     ),
+     *     "nbHits" => 0
+     *     "page" => 0,
+     *     "hitsPerPage" => 20
+     * ).
+     *
+     * @return mixed
+     * @throws AlgoliaException
+     */
+    public function searchUserIDs($query, $clusterName = null, $page = 0, $hitsPerPage = 20)
+    {
+        $requestHeaders = func_num_args() === 5 && is_array(func_get_arg(4)) ? func_get_arg(4) : array();
+
+        $params = array();
+
+        if ($query !== null) {
+            $params['query'] = $query;
+        }
+
+        if ($clusterName !== null) {
+            $params['cluster'] = $clusterName;
+        }
+
+        if ($page !== null) {
+            $params['page'] = $page;
+        }
+
+        if ($hitsPerPage !== null) {
+            $params['hitsPerPage'] = $hitsPerPage;
+        }
+
+        return $this->request(
+            $this->context,
+            'POST',
+            '/1/clusters/mapping/search',
+            null,
+            $params,
+            $this->context->readHostsArray,
+            $this->context->connectTimeout,
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
@@ -407,15 +742,22 @@ class Client
         return new Index($this->context, $this, $indexName);
     }
 
+    public function initAnalytics()
+    {
+        return new Analytics($this);
+    }
+
     /**
-     * List all existing user keys with their associated ACLs.
+     * List all existing API keys with their associated ACLs.
      *
      * @return mixed
      *
      * @throws AlgoliaException
      */
-    public function listUserKeys()
+    public function listApiKeys()
     {
+        $requestHeaders = func_num_args() === 1 && is_array(func_get_arg(0)) ? func_get_arg(0) : array();
+
         return $this->request(
             $this->context,
             'GET',
@@ -424,19 +766,31 @@ class Client
             null,
             $this->context->readHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
     /**
-     * Get ACL of a user key.
+     * @return mixed
+     * @deprecated use listApiKeys instead
+     */
+    public function listUserKeys()
+    {
+        return $this->listApiKeys();
+    }
+
+    /**
+     * Get ACL of a API key.
      *
      * @param string $key
      *
      * @return mixed
      */
-    public function getUserKeyACL($key)
+    public function getApiKey($key)
     {
+        $requestHeaders = func_num_args() === 2 && is_array(func_get_arg(1)) ? func_get_arg(1) : array();
+
         return $this->request(
             $this->context,
             'GET',
@@ -445,19 +799,32 @@ class Client
             null,
             $this->context->readHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
     /**
-     * Delete an existing user key.
+     * @param $key
+     * @return mixed
+     * @deprecated use getApiKey instead
+     */
+    public function getUserKeyACL($key)
+    {
+        return $this->getApiKey($key);
+    }
+
+    /**
+     * Delete an existing API key.
      *
      * @param string $key
      *
      * @return mixed
      */
-    public function deleteUserKey($key)
+    public function deleteApiKey($key)
     {
+        $requestHeaders = func_num_args() === 2 && is_array(func_get_arg(1)) ? func_get_arg(1) : array();
+
         return $this->request(
             $this->context,
             'DELETE',
@@ -466,12 +833,23 @@ class Client
             null,
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
     /**
-     * Create a new user key.
+     * @param $key
+     * @return mixed
+     * @deprecated use deleteApiKey instead
+     */
+    public function deleteUserKey($key)
+    {
+        return $this->deleteApiKey($key);
+    }
+
+    /**
+     * Create a new API key.
      *
      * @param array      $obj                    can be two different parameters:
      *                                           The list of parameters for this key. Defined by an array that
@@ -504,13 +882,22 @@ class Client
      *
      * @throws AlgoliaException
      */
-    public function addUserKey($obj, $validity = 0, $maxQueriesPerIPPerHour = 0, $maxHitsPerQuery = 0, $indexes = null)
+    public function addApiKey($obj, $validity = 0, $maxQueriesPerIPPerHour = 0, $maxHitsPerQuery = 0, $indexes = null)
     {
-        if ($obj !== array_values($obj)) { // is dict of value
+        $requestHeaders = func_num_args() === 6 && is_array(func_get_arg(5)) ? func_get_arg(5) : array();
+
+        if ($obj !== array_values($obj)) {
+            // if $obj doesn't have required entries, we add the default values
             $params = $obj;
-            $params['validity'] = $validity;
-            $params['maxQueriesPerIPPerHour'] = $maxQueriesPerIPPerHour;
-            $params['maxHitsPerQuery'] = $maxHitsPerQuery;
+            if ($validity != 0) {
+                $params['validity'] = $validity;
+            }
+            if ($maxQueriesPerIPPerHour != 0) {
+                $params['maxQueriesPerIPPerHour'] = $maxQueriesPerIPPerHour;
+            }
+            if ($maxHitsPerQuery != 0) {
+                $params['maxHitsPerQuery'] = $maxHitsPerQuery;
+            }
         } else {
             $params = array(
                 'acl'                    => $obj,
@@ -532,12 +919,27 @@ class Client
             $params,
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
     /**
-     * Update a user key.
+     * @param $obj
+     * @param int $validity
+     * @param int $maxQueriesPerIPPerHour
+     * @param int $maxHitsPerQuery
+     * @param null $indexes
+     * @return mixed
+     * @deprecated use addApiKey instead
+     */
+    public function addUserKey($obj, $validity = 0, $maxQueriesPerIPPerHour = 0, $maxHitsPerQuery = 0, $indexes = null)
+    {
+        return $this->addApiKey($obj, $validity, $maxQueriesPerIPPerHour, $maxHitsPerQuery, $indexes);
+    }
+
+    /**
+     * Update an API key.
      *
      * @param string     $key
      * @param array      $obj                    can be two different parameters:
@@ -571,7 +973,7 @@ class Client
      *
      * @throws AlgoliaException
      */
-    public function updateUserKey(
+    public function updateApiKey(
         $key,
         $obj,
         $validity = 0,
@@ -579,11 +981,20 @@ class Client
         $maxHitsPerQuery = 0,
         $indexes = null
     ) {
-        if ($obj !== array_values($obj)) { // is dict of value
+        $requestHeaders = func_num_args() === 7 && is_array(func_get_arg(6)) ? func_get_arg(6) : array();
+
+        if ($obj !== array_values($obj)) {
+            // if $obj doesn't have required entries, we add the default values
             $params = $obj;
-            $params['validity'] = $validity;
-            $params['maxQueriesPerIPPerHour'] = $maxQueriesPerIPPerHour;
-            $params['maxHitsPerQuery'] = $maxHitsPerQuery;
+            if ($validity != 0) {
+                $params['validity'] = $validity;
+            }
+            if ($maxQueriesPerIPPerHour != 0) {
+                $params['maxQueriesPerIPPerHour'] = $maxQueriesPerIPPerHour;
+            }
+            if ($maxHitsPerQuery != 0) {
+                $params['maxHitsPerQuery'] = $maxHitsPerQuery;
+            }
         } else {
             $params = array(
                 'acl'                    => $obj,
@@ -592,6 +1003,7 @@ class Client
                 'maxHitsPerQuery'        => $maxHitsPerQuery,
             );
         }
+
         if ($indexes != null) {
             $params['indexes'] = $indexes;
         }
@@ -604,28 +1016,56 @@ class Client
             $params,
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
+    }
+
+    /**
+     * @param $key
+     * @param $obj
+     * @param int $validity
+     * @param int $maxQueriesPerIPPerHour
+     * @param int $maxHitsPerQuery
+     * @param null $indexes
+     * @return mixed
+     * @deprecated use updateApiKey instead
+     */
+    public function updateUserKey(
+        $key,
+        $obj,
+        $validity = 0,
+        $maxQueriesPerIPPerHour = 0,
+        $maxHitsPerQuery = 0,
+        $indexes = null
+    ) {
+        $requestHeaders = func_num_args() === 7 && is_array(func_get_arg(6)) ? func_get_arg(6) : array();
+
+        return $this->updateApiKey($key, $obj, $validity, $maxQueriesPerIPPerHour, $maxHitsPerQuery, $indexes, $requestHeaders);
     }
 
     /**
      * Send a batch request targeting multiple indices.
      *
-     * @param array $requests an associative array defining the batch request body
+     * @param array $operations an associative array defining the batch request body
+     * @param array $requestHeaders
      *
      * @return mixed
      */
-    public function batch($requests)
+    public function batch($operations)
     {
+        $requestHeaders = func_num_args() === 2 && is_array(func_get_arg(1)) ? func_get_arg(1) : array();
+
         return $this->request(
             $this->context,
             'POST',
             '/1/indexes/*/batch',
             array(),
-            array('requests' => $requests),
+            array('requests' => $operations),
             $this->context->writeHostsArray,
             $this->context->connectTimeout,
-            $this->context->readTimeout
+            $this->context->readTimeout,
+            $requestHeaders
         );
     }
 
@@ -641,7 +1081,6 @@ class Client
      */
     public static function generateSecuredApiKey($privateApiKey, $query, $userToken = null)
     {
-        $urlEncodedQuery = '';
         if (is_array($query)) {
             $queryParameters = array();
             if (array_keys($query) !== array_keys(array_keys($query))) {
@@ -711,6 +1150,7 @@ class Client
      * @param array         $hostsArray
      * @param int           $connectTimeout
      * @param int           $readTimeout
+     * @param array         $requestHeaders
      *
      * @return mixed
      *
@@ -726,6 +1166,8 @@ class Client
         $connectTimeout,
         $readTimeout
     ) {
+        $requestHeaders = func_num_args() === 9 && is_array(func_get_arg(8)) ? func_get_arg(8) : array();
+
         $exceptions = array();
         $cnt = 0;
         foreach ($hostsArray as &$host) {
@@ -735,7 +1177,7 @@ class Client
                 $readTimeout += 10;
             }
             try {
-                $res = $this->doRequest($context, $method, $host, $path, $params, $data, $connectTimeout, $readTimeout);
+                $res = $this->doRequest($context, $method, $host, $path, $params, $data, $connectTimeout, $readTimeout, $requestHeaders);
                 if ($res !== null) {
                     return $res;
                 }
@@ -749,7 +1191,7 @@ class Client
                 }
             }
         }
-        throw new AlgoliaException('Hosts unreachable: '.implode(',', $exceptions));
+        throw new AlgoliaConnectionException('Hosts unreachable: '.implode(',', $exceptions));
     }
 
     /**
@@ -761,6 +1203,7 @@ class Client
      * @param array         $data
      * @param int           $connectTimeout
      * @param int           $readTimeout
+     * @param array         $requestHeaders
      *
      * @return mixed
      *
@@ -777,6 +1220,8 @@ class Client
         $connectTimeout,
         $readTimeout
     ) {
+        $requestHeaders = func_num_args() === 9 && is_array(func_get_arg(8)) ? func_get_arg(8) : array();
+
         if (strpos($host, 'http') === 0) {
             $url = $host.$path;
         } else {
@@ -827,7 +1272,7 @@ class Client
             );
         }
 
-        $headers = array_merge($defaultHeaders, $context->headers);
+        $headers = array_merge($defaultHeaders, $context->headers, $requestHeaders);
 
         $curlHeaders = array();
         foreach ($headers as $key => $value) {
@@ -913,14 +1358,19 @@ class Client
             return;
         }
 
-        $answer = Json::decode($response, true);
         $context->releaseMHandle($curlHandle);
         curl_close($curlHandle);
 
+        if ($http_status == 204) {
+            return '';
+        }
+
+        $answer = Json::decode($response, true);
+
         if (intval($http_status / 100) == 4) {
-            throw new AlgoliaException(isset($answer['message']) ? $answer['message'] : $http_status . ' error');
+            throw new AlgoliaException(isset($answer['message']) ? $answer['message'] : $http_status.' error', $http_status);
         } elseif (intval($http_status / 100) != 2) {
-            throw new \Exception($http_status.': '.$response);
+            throw new \Exception($http_status.': '.$response, $http_status);
         }
 
         return $answer;
@@ -1013,14 +1463,14 @@ class Client
     }
 
     /**
-     * @param string $appId
-     * @param string $apiKey
-     * @param array  $hostsArray
-     * @param array  $options
+     * @param string|null $appId
+     * @param string|null $apiKey
+     * @param array|null  $hostsArray
+     * @param array       $options
      *
      * @return PlacesIndex
      */
-    public static function initPlaces($appId, $apiKey, $hostsArray = null, $options = array())
+    public static function initPlaces($appId = null, $apiKey = null, $hostsArray = null, $options = array())
     {
         $options['placesEnabled'] = true;
         $client = new static($appId, $apiKey, $hostsArray, $options);

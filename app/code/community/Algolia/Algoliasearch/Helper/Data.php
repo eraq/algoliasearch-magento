@@ -100,6 +100,8 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
         }
 
         $this->product_helper->setSettings($storeId, $saveToTmpIndicesToo);
+
+        $this->setExtraSettings($storeId, $saveToTmpIndicesToo);
     }
 
     public function getSearchResult($query, $storeId)
@@ -183,7 +185,7 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
         }
     }
 
-    public function rebuildStorePageIndex($storeId)
+    public function rebuildStorePageIndex($storeId, $pageIds = null)
     {
         if ($this->config->isEnabledBackend($storeId) === false) {
             $this->logger->log('INDEXING IS DISABLED FOR '.$this->logger->getStoreName($storeId));
@@ -191,19 +193,24 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
             return;
         }
 
+        $shouldUseTmpIndex = ($pageIds === null);
+
         $emulationInfo = $this->startEmulation($storeId);
 
-        $index_name = $this->page_helper->getIndexName($storeId);
+        $indexName = $this->page_helper->getIndexName($storeId, $shouldUseTmpIndex);
 
-        $pages = $this->page_helper->getPages($storeId);
-
+        /** @var array $pages */
+        $pages = $this->page_helper->getPages($storeId, $pageIds);
         foreach (array_chunk($pages, 100) as $chunk) {
-            $this->algolia_helper->addObjects($chunk, $index_name.'_tmp');
+            $this->algolia_helper->addObjects($chunk, $indexName);
         }
 
-        $this->algolia_helper->moveIndex($index_name.'_tmp', $index_name);
+        if ($shouldUseTmpIndex === true) {
+            $finalIndexName = $this->page_helper->getIndexName($storeId);
 
-        $this->algolia_helper->setSettings($index_name, $this->page_helper->getIndexSettings($storeId));
+            $this->algolia_helper->moveIndex($indexName, $finalIndexName);
+            $this->algolia_helper->setSettings($finalIndexName, $this->page_helper->getIndexSettings($storeId));
+        }
 
         $this->stopEmulation($emulationInfo);
     }
@@ -358,10 +365,10 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
         foreach ($collection as $suggestion) {
             $suggestion->setStoreId($storeId);
 
-            $suggestion_obj = $this->suggestion_helper->getObject($suggestion);
+            $suggestionObject = $this->suggestion_helper->getObject($suggestion);
 
-            if (strlen($suggestion_obj['query']) >= 3) {
-                array_push($indexData, $suggestion_obj);
+            if (strlen($suggestionObject['query']) >= 3) {
+                array_push($indexData, $suggestionObject);
             }
         }
 
@@ -407,10 +414,10 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
 
             $category->setStoreId($storeId);
 
-            $category_obj = $this->category_helper->getObject($category);
+            $categoryObject = $this->category_helper->getObject($category);
 
-            if ($category_obj['product_count'] > 0) {
-                array_push($indexData, $category_obj);
+            if ($this->config->shouldIndexEmptyCategories($storeId) === true || $categoryObject['product_count'] > 0) {
+                array_push($indexData, $categoryObject);
             }
         }
 
@@ -436,10 +443,23 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
         $productsToRemove = array();
 
         // In $potentiallyDeletedProductsIds there might be IDs of deleted products which will not be in a collection
-        if (is_array($potentiallyDeletedProductsIds)) {
+        if (is_array($potentiallyDeletedProductsIds) && !empty($potentiallyDeletedProductsIds)) {
             $potentiallyDeletedProductsIds = array_combine($potentiallyDeletedProductsIds, $potentiallyDeletedProductsIds);
         } else {
             $potentiallyDeletedProductsIds = array();
+        }
+
+        if (method_exists('Mage', 'getEdition') === true && Mage::getEdition() === Mage::EDITION_ENTERPRISE) {
+            $productIds = array();
+
+            /** @var Mage_Catalog_Model_Product $products */
+            foreach ($collection as $products) {
+                $productIds[] = $products->getId();
+            }
+
+            /** @var Algolia_Algoliasearch_Helper_IndexChecker $indexChecker */
+            $indexChecker = Mage::helper('algoliasearch/indexChecker');
+            $indexChecker->checkIndexers($storeId, $productIds);
         }
 
         $this->logger->start('CREATE RECORDS '.$this->logger->getStoreName($storeId));
@@ -456,21 +476,28 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
                 unset($potentiallyDeletedProductsIds[$productId]);
             }
 
+            Mage::dispatchEvent('algolia_before_product_availability_check', array('product' => $product, 'store' => $storeId));
+
+            if ($product->getData('algolia__noIndex') === true) {
+                $productsToRemove[$productId] = $productId;
+            }
+
+            if ($product->getData('algolia__alwaysIndex') === true) {
+                $productsToIndex[$productId] = $this->product_helper->getObject($product);
+            }
+
             if (isset($productsToIndex[$productId]) || isset($productsToRemove[$productId])) {
                 continue;
             }
 
-            if ($product->isDeleted() === true
-                || $product->getStatus() == Mage_Catalog_Model_Product_Status::STATUS_DISABLED
-                || (int) $product->getVisibility() <= Mage_Catalog_Model_Product_Visibility::VISIBILITY_NOT_VISIBLE
-                || ($product->getStockItem()->is_in_stock == 0 && !$this->config->getShowOutOfStock($storeId))
-            ) {
+            try {
+                $this->product_helper->canProductBeReindexed($product, $storeId);
+            } catch (Algolia_Algoliasearch_Model_Exception_ProductReindexException $e) {
                 $productsToRemove[$productId] = $productId;
                 continue;
             }
 
-            $json = $this->product_helper->getObject($product);
-            $productsToIndex[$productId] = $json;
+            $productsToIndex[$productId] = $this->product_helper->getObject($product);
         }
 
         $productsToRemove = array_merge($productsToRemove, $potentiallyDeletedProductsIds);
@@ -482,7 +509,6 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
             'toRemove' => array_unique($productsToRemove),
         );
     }
-
     public function rebuildStoreProductIndexPage($storeId, $collectionDefault, $page, $pageSize, $emulationInfo = null, $productIds = null, $useTmpIndex = false)
     {
         if ($this->config->isEnabledBackend($storeId) === false) {
@@ -541,26 +567,45 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
         $this->logger->log('Loaded '.count($collection).' products');
         $this->logger->stop('LOADING '.$this->logger->getStoreName($storeId).' collection page '.$page.', pageSize '.$pageSize);
 
-        $index_name = $this->product_helper->getIndexName($storeId, $useTmpIndex);
+        $indexName = $this->product_helper->getIndexName($storeId, $useTmpIndex);
 
         $indexData = $this->getProductsRecords($storeId, $collection, $productIds);
 
         if (!empty($indexData['toIndex'])) {
             $this->logger->start('ADD/UPDATE TO ALGOLIA');
 
-            $this->algolia_helper->addObjects($indexData['toIndex'], $index_name);
+            $this->algolia_helper->addObjects($indexData['toIndex'], $indexName);
 
             $this->logger->log('Product IDs: '.implode(', ', array_keys($indexData['toIndex'])));
             $this->logger->stop('ADD/UPDATE TO ALGOLIA');
         }
 
         if (!empty($indexData['toRemove'])) {
-            $this->logger->start('REMOVE FROM ALGOLIA');
+            $toRealRemove = array();
 
-            $this->algolia_helper->deleteObjects($indexData['toRemove'], $index_name);
+            if (count($indexData['toRemove']) === 1) {
+                $toRealRemove = $indexData['toRemove'];
+            } else {
+                $indexData['toRemove'] = array_map('strval', $indexData['toRemove']);
 
-            $this->logger->log('Product IDs: '.implode(', ', $indexData['toRemove']));
-            $this->logger->stop('REMOVE FROM ALGOLIA');
+                foreach (array_chunk($indexData['toRemove'], 1000) as $chunk) {
+                    $objects = $this->algolia_helper->getObjects($indexName, $chunk);
+                    foreach ($objects['results'] as $object) {
+                        if (isset($object['objectID'])) {
+                            $toRealRemove[] = $object['objectID'];
+                        }
+                    }
+                }
+            }
+
+            if (!empty($toRealRemove)) {
+                $this->logger->start('REMOVE FROM ALGOLIA');
+
+                $this->algolia_helper->deleteObjects($toRealRemove, $indexName);
+                $this->logger->log('Product IDs: '.implode(', ', $toRealRemove));
+
+                $this->logger->stop('REMOVE FROM ALGOLIA');
+            }
         }
 
         unset($indexData);
@@ -596,6 +641,9 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
         Mage::app()->getStore($storeId)->setConfig(Mage_Catalog_Helper_Product_Flat::XML_PATH_USE_PRODUCT_FLAT, false);
         Mage::app()->getStore($storeId)
             ->setConfig(Mage_Catalog_Helper_Category_Flat::XML_PATH_IS_ENABLED_FLAT_CATALOG_CATEGORY, false);
+
+        // Init translator so it's available in custom events
+        Mage::app()->getTranslator()->init('frontend', true);
 
         $this->logger->stop('START EMULATION');
 
@@ -639,5 +687,89 @@ class Algolia_Algoliasearch_Helper_Data extends Mage_Core_Helper_Abstract
             
         return Mage::EDITION_ENTERPRISE === Mage::getEdition() && version_compare(Mage::getVersion(), '1.14.3', '>=') ||
                Mage::EDITION_COMMUNITY === Mage::getEdition() && version_compare(Mage::getVersion(), '1.9.3', '>=');
+    }
+
+    private function setExtraSettings($storeId, $saveToTmpIndicesToo)
+    {
+        $sections = array(
+            'products' => $this->product_helper->getIndexName($storeId),
+            'categories' => $this->category_helper->getIndexName($storeId),
+            'pages' => $this->page_helper->getIndexName($storeId),
+            'suggestions' => $this->suggestion_helper->getIndexName($storeId),
+            'additional_sections' => $this->additionalsections_helper->getIndexName($storeId),
+        );
+
+        $error = array();
+        foreach ($sections as $section => $indexName) {
+            try {
+                $extraSettings = $this->config->getExtraSettings($section, $storeId);
+
+                if ($extraSettings) {
+                    $extraSettings = json_decode($extraSettings, true);
+
+                    $this->algolia_helper->setSettings($indexName, $extraSettings, true);
+
+                    if ($section === 'products' && $saveToTmpIndicesToo === true) {
+                        $this->algolia_helper->setSettings($indexName.'_tmp', $extraSettings, true);
+                    }
+                }
+            } catch (\AlgoliaSearch\AlgoliaException $e) {
+                if (strpos($e->getMessage(), 'Invalid object attributes:') === 0) {
+                    $error[] = 'Extra settings for "'.$section.'" indices were not saved. Error message: "'.$e->getMessage().'"';
+                    continue;
+                }
+
+                throw $e;
+            }
+        }
+
+        if (!empty($error)) {
+            throw new \AlgoliaSearch\AlgoliaException('<br>'.implode('<br> ', $error));
+        }
+    }
+
+    public function deleteInactiveProducts($storeId)
+    {
+        $indexName = $this->product_helper->getIndexName($storeId);
+        $index = $this->algolia_helper->getIndex($indexName);
+
+        $objectIds = array();
+        $counter = 0;
+
+        try {
+            foreach ($index->browse('', array('attributesToRetrieve' => array('objectID'))) as $hit) {
+                $objectIds[] = $hit['objectID'];
+                $counter++;
+
+                if ($counter === 1000) {
+                    $this->deleteInactiveIds($storeId, $objectIds, $indexName);
+
+                    $objectIds = array();
+                    $counter = 0;
+                }
+            }
+
+            if (!empty($objectIds)) {
+                $this->deleteInactiveIds($storeId, $objectIds, $indexName);
+            }
+        } catch (\AlgoliaSearch\AlgoliaException $e) {
+            $message = $e->getMessage();
+
+            // Fail silently if the exception tells that Index does not exist
+            if (!preg_match('/^Index (.*) does not exist$/', $message)) {
+                throw $e;
+            }
+        }
+    }
+
+    private function deleteInactiveIds($storeId, $objectIds, $indexName)
+    {
+        $collection = $this->product_helper->getProductCollectionQuery($storeId, $objectIds);
+        $dbIds = $collection->getAllIds();
+        
+        $collection = null;
+
+        $idsToDeleteFromAlgolia = array_diff($objectIds, $dbIds);
+        $this->algolia_helper->deleteObjects($idsToDeleteFromAlgolia, $indexName);
     }
 }

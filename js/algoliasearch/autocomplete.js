@@ -56,10 +56,6 @@ document.addEventListener("DOMContentLoaded", function(event) {
 		});
 		
 		/**
-		 * ADD YOUR CUSTOM DATA SOURCE HERE
-		 **/
-		
-		/**
 		 * Setup the autocomplete search input
 		 * For autocomplete feature is used Algolia's autocomplete.js library
 		 * Docs: https://github.com/algolia/autocomplete.js
@@ -72,7 +68,7 @@ document.addEventListener("DOMContentLoaded", function(event) {
 					dropdownMenu: '#menu-template'
 				},
 				dropdownMenuContainer: "#algolia-autocomplete-container",
-				debug: false
+				debug: algoliaConfig.autocomplete.isDebugEnabled
 			};
 			
 			if (isMobile() === true) {
@@ -82,6 +78,20 @@ document.addEventListener("DOMContentLoaded", function(event) {
 			
 			if (algoliaConfig.removeBranding === false) {
 				options.templates.footer = '<div class="footer_algolia"><a href="https://www.algolia.com/?utm_source=magento&utm_medium=link&utm_campaign=magento_autocompletion_menu" title="Search by Algolia" target="_blank"><img src="' +algoliaConfig.urls.logo + '" alt="Search by Algolia" /></a></div>';
+			}
+
+			sources = algolia.triggerHooks('beforeAutocompleteSources', sources, algolia_client, algoliaBundle);
+			options = algolia.triggerHooks('beforeAutocompleteOptions', options);
+			
+			if (typeof algoliaHookBeforeAutocompleteStart === 'function') {
+				console.warn('Deprecated! You are using an old API for Algolia\'s front end hooks. ' +
+					'Please, replace your hook method with new hook API. ' +
+					'More information you can find on https://community.algolia.com/magento/doc/m1/frontend-events/');
+
+				var hookResult = algoliaHookBeforeAutocompleteStart(sources, options, algolia_client);
+				
+				sources = hookResult.shift();
+				options = hookResult.shift();
 			}
 			
 			/** Bind autocomplete feature to the input */
@@ -100,6 +110,28 @@ document.addEventListener("DOMContentLoaded", function(event) {
 			
 			$(window).resize(function () {
 				fixAutocompleteCssSticky(menu);
+			});
+		});
+		
+		// Hack to handle buggy onclick event on iOS
+		$(algoliaConfig.autocomplete.selector).each(function () {
+			var data = $(this).data('aaAutocomplete');
+			var dropdown = data.dropdown;
+			var suggestionClass = '.' + dropdown.cssClasses.prefix + dropdown.cssClasses.suggestion;
+			
+			var touchmoved;
+			dropdown.$menu.on('touchend', suggestionClass, function (e) {
+				if(touchmoved === false) {
+					e.preventDefault();
+					e.stopPropagation();
+					
+					var url = $(this).find('a').attr('href');
+					location.assign(url);
+				}
+			}).on('touchmove', function (){
+				touchmoved = true;
+			}).on('touchstart', function(){
+				touchmoved = false;
 			});
 		});
 	});

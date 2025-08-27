@@ -21,45 +21,35 @@ class Algolia_Algoliasearch_Helper_Entity_Pagehelper extends Algolia_Algoliasear
         return $indexSettings;
     }
 
-    public function getPages($storeId)
+    public function getPages($storeId, $pageIds = null)
     {
-        /** @var Mage_Cms_Model_Page $cmsPage */
-        $cmsPage = Mage::getModel('cms/page');
-
         /** @var Mage_Cms_Model_Resource_Page_Collection $pages */
-        $pages = $cmsPage->getCollection()->addStoreFilter($storeId)->addFieldToFilter('is_active', 1);
+        $pageCollection = Mage::getModel('cms/page')->getCollection()
+            ->addStoreFilter($storeId)
+            ->addFieldToFilter('is_active', 1);
 
-        Mage::dispatchEvent('algolia_after_pages_collection_build', array('store' => $storeId, 'collection' => $pages));
+        if ($pageIds && count($pageIds) > 0) {
+            $pageCollection->addFieldToFilter('page_id', array('in' => $pageIds));
+        }
 
-        $ids = $pages->toOptionArray();
+        Mage::dispatchEvent('algolia_after_pages_collection_build', array('store' => $storeId, 'collection' => $pageCollection));
 
-        $exludedPages = array_values($this->config->getExcludedPages());
-
-        foreach ($exludedPages as &$excludedPage) {
+        $excludedPages = array_values($this->config->getExcludedPages());
+        foreach ($excludedPages as &$excludedPage) {
             $excludedPage = $excludedPage['pages'];
         }
 
         $pages = array();
-
-        foreach ($ids as $key => $value) {
-            if (in_array($value['value'], $exludedPages)) {
+        /** @var Mage_Cms_Model_Page $page */
+        foreach ($pageCollection as $page) {
+            if (in_array($page->getIdentifier(), $excludedPages)) {
                 continue;
             }
 
             $pageObject = array();
 
-            $pageObject['slug'] = $value['value'];
-            $pageObject['name'] = $value['label'];
-
-            /** @var Mage_Cms_Model_Page $page */
-            $page = Mage::getModel('cms/page');
-
-            $page->setStoreId($storeId);
-            $page->load($pageObject['slug'], 'identifier');
-
-            if (!$page->getId()) {
-                continue;
-            }
+            $pageObject['slug'] = $page->getIdentifier();
+            $pageObject['name'] = $page->getTitle();
 
             $content = $page->getContent();
             if ($this->config->getRenderTemplateDirectives()) {
@@ -74,15 +64,28 @@ class Algolia_Algoliasearch_Helper_Entity_Pagehelper extends Algolia_Algoliasear
 
             $pageObject['objectID'] = $page->getId();
             $pageObject['url'] = $cmsPageHelper->getPageUrl($page->getId());
-            $pageObject['content'] = $this->strip($content);
+            $pageObject['content'] = $this->strip($content, array('script', 'style'));
 
             $transport = new Varien_Object($pageObject);
-            Mage::dispatchEvent('algolia_after_create_page_object', array('page' => $transport));
+            Mage::dispatchEvent('algolia_after_create_page_object', array('page' => $transport, 'pageObject' => $page));
             $pageObject = $transport->getData();
 
             $pages[] = $pageObject;
         }
 
         return $pages;
+    }
+
+    public function shouldIndexPages($storeId)
+    {
+        $autocompleteSections = $this->config->getAutocompleteSections($storeId);
+
+        foreach ($autocompleteSections as $section) {
+            if ($section['name'] === 'pages') {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
